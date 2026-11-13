@@ -1,0 +1,9 @@
+.env
+*.env
+sesion.json
+home.json
+respuestas.json
+*.png
+__pycache__/
+.venv/
+venv/
