@@ -1,3 +1,5 @@
+"""Transforma los bloques de respuesta de Telcel"""
+
 import re
 from datetime import date
 
@@ -34,14 +36,17 @@ def indexar(nodo, out=None):
 
 
 def _valor(b, bid):
+    """Obtiene el valor de un bloque por su identificador."""
     return (b.get(bid) or {}).get("value")
 
 
 def _visible(b, bid):
+    """Indica si el bloque existe y no está oculto."""
     return bid in b and b[bid].get("visibility", True) is not False
 
 
 def _a_float(txt):
+    """Extrae el primer número de un texto y lo convierte a float."""
     if not txt:
         return None
     m = re.search(r"\d[\d,]*\.?\d*", txt)
@@ -49,7 +54,7 @@ def _a_float(txt):
 
 
 def _fecha_es(txt, hoy=None):
-    """'21 de noviembre' -> date (año actual, o el siguiente si ya pasó)."""
+    """Convierte una fecha en español al año actual o al siguiente si ya pasó."""
     hoy = hoy or date.today()
     m = re.match(r"(\d{1,2}) de (\w+)", (txt or "").strip().lower())
     if not m or m.group(2) not in MESES:
@@ -59,12 +64,14 @@ def _fecha_es(txt, hoy=None):
 
 
 def _dias_desde_mensaje(cfg):
+    """Extrae del mensaje la cantidad de días restantes, si está disponible."""
     texto = "".join(s.get("text", "") for s in (cfg or {}).get("segments", []))
     m = re.search(r"Faltan\s+(\d+)\s+d", texto)
     return int(m.group(1)) if m else None
 
 
 def _parsear_paquetes(b):
+    """Interpreta los bloques de consumo y vigencia de los paquetes."""
     paquetes = []
     for bid in b:
         m = RE_PAQUETE.match(bid)
@@ -94,6 +101,7 @@ def _parsear_paquetes(b):
         )
 
         unidad = _valor(b, f"tabs-plans-v2-available-data-unit-{s}") or ""
+        texto_disponible = _valor(b, f"tabs-plans-v2-available-data-value-{s}") or ""
         paquetes.append(
             {
                 "nombre": _valor(b, bid),
@@ -106,7 +114,7 @@ def _parsear_paquetes(b):
                 "porcentaje_disponible": (
                     round(disp_kb * 100 / total_kb, 1) if total_kb else None
                 ),
-                "disponible_texto": f'{_valor(b, f"tabs-plans-v2-available-data-value-{s}") or ""} {unidad}'.strip(),
+                "disponible_texto": f"{texto_disponible} {unidad}".strip(),
                 "dias_restantes": _dias_desde_mensaje(b.get(msg_id)),
                 "actualizado_telcel": chart.get("available", {}).get("updatedAt"),
             }
@@ -115,6 +123,7 @@ def _parsear_paquetes(b):
 
 
 def parsear_home(data: dict) -> dict:
+    """Convierte la respuesta de inicio de Telcel a los datos del servicio."""
     b = indexar(data.get("blocks", {}))
 
     # Si Telcel mostró su tarjeta de error, mejor fallar para no guardar basura

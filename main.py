@@ -1,17 +1,36 @@
-import os, re, sys, time, json, hmac, base64, hashlib, secrets, asyncio, logging, traceback
+"""API de saldo de Mi Telcel con caché en memoria"""
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import secrets
+import sys
+import time
+import traceback
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from playwright.async_api import async_playwright
+from playwright.async_api import Error as PlaywrightError, async_playwright
 
 from parser_telcel import parsear_home
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("telcel")
 
-# ===== Configuración (solo variables del servidor, nada de usuarios) =====
+# Configuración (solo variables del servidor, nada de usuarios)
 API_KEY = os.environ["API_KEY"]
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 CACHE_SEG = int(os.getenv("CACHE_SEG", "600"))  # 10 min por usuario
@@ -37,7 +56,8 @@ UA = (
 )
 
 PATRON_COOKIES = re.compile(
-    r"^\s*(acepto las cookies|acepto|aceptar( todas| todo| cookies| y cerrar)?|entendido|de acuerdo|ok)\s*$",
+    r"^\s*(acepto las cookies|acepto|"
+    r"aceptar( todas| todo| cookies| y cerrar)?|entendido|de acuerdo|ok)\s*$",
     re.I,
 )
 JS_QUITAR_COOKIES = """() => {
@@ -45,7 +65,8 @@ JS_QUITAR_COOKIES = """() => {
   document.querySelectorAll('body *').forEach(el => {
     const s = getComputedStyle(el);
     if (!['fixed', 'sticky'].includes(s.position)) return;
-    const pista = (el.id || '') + ' ' + String(el.className || '') + ' ' + (el.innerText || '').slice(0, 300);
+    const pista = (el.id || '') + ' ' + String(el.className || '') + ' ' +
+      (el.innerText || '').slice(0, 300);
     if (/cookie/i.test(pista) && !el.querySelector('iframe')) { el.remove(); n++; }
   });
   document.documentElement.style.overflow = 'auto';
@@ -53,7 +74,7 @@ JS_QUITAR_COOKIES = """() => {
   return n;
 }"""
 
-# ===== Estado en memoria =====
+# Estado en memoria
 SECRETO = secrets.token_bytes(
     32
 )  # cambia en cada arranque; las huellas no sirven fuera del proceso
@@ -62,32 +83,40 @@ sem_login = asyncio.Semaphore(MAX_LOGINS)
 
 
 class LoginFallido(Exception):
+    """Indica que no fue posible obtener un token al iniciar sesión."""
+
     pass
 
 
 class Credenciales(BaseModel):
+    """Valida el número telefónico y la contraseña de la solicitud."""
+
     numero: str = Field(pattern=r"^\d{10}$")
     password: str = Field(min_length=6, max_length=50)
 
 
 def enmascarar(num: str) -> str:
+    """Oculta el número y conserva visibles sus últimos cuatro dígitos."""
     return "******" + num[-4:]
 
 
 def huella(pwd: str) -> str:
+    """Calcula una huella HMAC de la contraseña para comparaciones seguras."""
     return hmac.new(SECRETO, pwd.encode(), hashlib.sha256).hexdigest()
 
 
 def jwt_exp(token: str) -> int:
+    """Obtiene la fecha de expiración del token JWT, o cero si no es válido."""
     try:
-        p = token.split(".")[1]
-        p += "=" * (-len(p) % 4)
-        return int(json.loads(base64.urlsafe_b64decode(p)).get("exp", 0))
-    except Exception:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0))
+    except (IndexError, TypeError, ValueError):
         return 0
 
 
 def usuario(num: str) -> dict:
+    """Obtiene o inicializa el estado en memoria asociado al número."""
     if num not in usuarios:
         usuarios[num] = {
             "lock": asyncio.Lock(),
@@ -102,15 +131,16 @@ def usuario(num: str) -> dict:
     return usuarios[num]
 
 
-# ===== Playwright =====
+# Playwright
 async def cerrar_cookies(page, espera_s=8) -> bool:
+    """Cierra o elimina el aviso de cookies y devuelve si tuvo éxito."""
     try:
         btn = page.get_by_role("button", name=re.compile(r"acepto las cookies", re.I))
         await btn.first.wait_for(state="visible", timeout=espera_s * 1000)
         await btn.first.click(timeout=3000)
         log.info("Aviso de cookies cerrado (botón Mi Telcel)")
         return True
-    except Exception:
+    except PlaywrightError:
         pass
     for frame in page.frames:
         try:
@@ -118,29 +148,31 @@ async def cerrar_cookies(page, espera_s=8) -> bool:
             if await loc.count() and await loc.first.is_visible():
                 await loc.first.click(timeout=3000)
                 return True
-        except Exception:
+        except PlaywrightError:
             pass
     try:
         return bool(await page.evaluate(JS_QUITAR_COOKIES))
-    except Exception:
+    except PlaywrightError:
         return False
 
 
 async def encontrar_frame_login(page, timeout_s=30):
+    """Espera y devuelve el frame que contiene el formulario de inicio de sesión."""
     for _ in range(timeout_s * 2):
         for frame in page.frames:
             try:
                 if await frame.locator("#sso-input-number").count() > 0:
                     return frame
-            except Exception:
+            except PlaywrightError:
                 pass
         await asyncio.sleep(0.5)
     raise RuntimeError("Formulario de login no encontrado")
 
 
 async def _login_async(num: str, pwd: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+    """Inicia sesión con Playwright y devuelve el token obtenido, si existe."""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
             headless=HEADLESS,
             args=["--disable-dev-shm-usage", "--disable-gpu"],
         )
@@ -165,7 +197,7 @@ async def _login_async(num: str, pwd: str):
             for _ in range(60):
                 try:
                     token = await page.evaluate(JS_TOKEN)
-                except Exception:
+                except PlaywrightError:
                     token = None
                 if token:
                     return token
@@ -176,6 +208,7 @@ async def _login_async(num: str, pwd: str):
 
 
 def _correr_login_en_hilo(num: str, pwd: str):
+    """Ejecuta el flujo asíncrono de inicio de sesión en un event loop propio."""
     loop = (
         asyncio.ProactorEventLoop()
         if sys.platform == "win32"
@@ -188,6 +221,7 @@ def _correr_login_en_hilo(num: str, pwd: str):
 
 
 async def login(num: str, pwd: str) -> str:
+    """Inicia sesión con concurrencia limitada y devuelve el token válido."""
     async with sem_login:
         log.info("Login para %s", enmascarar(num))
         token = await asyncio.to_thread(_correr_login_en_hilo, num, pwd)
@@ -204,8 +238,9 @@ async def login(num: str, pwd: str) -> str:
 
 
 async def consultar(num: str, token: str):
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(
+    """Consulta los datos de inicio para el número usando el token indicado."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
             URL_HOME.format(num=num),
             headers={
                 "authorization": f"Bearer {token}",
@@ -213,27 +248,29 @@ async def consultar(num: str, token: str):
                 "user-agent": UA,
             },
         )
-    if r.status_code in (401, 403):
+    if response.status_code in (401, 403):
         return None
-    r.raise_for_status()
-    return r.json()
+    response.raise_for_status()
+    return response.json()
 
 
-# ===== API =====
+# API
 async def limpieza():
+    """Elimina periódicamente los estados de usuarios inactivos."""
     while True:
         await asyncio.sleep(3600)
         limite = time.time() - INACTIVO_SEG
         for num in [
-            n
-            for n, u in usuarios.items()
-            if u["ultimo_uso"] < limite and not u["lock"].locked()
+            numero
+            for numero, estado in usuarios.items()
+            if estado["ultimo_uso"] < limite and not estado["lock"].locked()
         ]:
             usuarios.pop(num, None)
 
 
 @asynccontextmanager
-async def lifespan(app):
+async def lifespan(_app):
+    """Inicia y detiene la tarea periódica de limpieza de usuarios."""
     tarea = asyncio.create_task(limpieza())
     yield
     tarea.cancel()
@@ -242,10 +279,11 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 
-def resp(u, desde_cache, error=None):
+def resp(estado, desde_cache, error=None):
+    """Construye la respuesta con el estado almacenado."""
     return {
-        "data": u["data"],
-        "actualizado": u["actualizado"],
+        "data": estado["data"],
+        "actualizado": estado["actualizado"],
         "desde_cache": desde_cache,
         "error": error,
     }
@@ -253,57 +291,70 @@ def resp(u, desde_cache, error=None):
 
 @app.post("/saldo")
 async def saldo(cred: Credenciales, x_api_key: str | None = Header(None)):
+    """Valida las credenciales y devuelve el saldo desde caché o Telcel."""
     if x_api_key != API_KEY:
         raise HTTPException(401, "API key inválida")
 
-    num, h = cred.numero, huella(cred.password)
-    u = usuario(num)
+    num, huella_password = cred.numero, huella(cred.password)
+    estado = usuario(num)
 
-    async with u["lock"]:  # evita logins duplicados del mismo número
+    async with estado["lock"]:  # evita logins duplicados del mismo número
         ahora = time.time()
-        u["ultimo_uso"] = ahora
+        estado["ultimo_uso"] = ahora
 
-        if u["fallidos"].get(h, 0) > ahora:
+        if estado["fallidos"].get(huella_password, 0) > ahora:
             raise HTTPException(429, "Login fallido reciente; espera unos minutos")
 
-        mismo = u["huella"] is not None and hmac.compare_digest(u["huella"], h)
+        mismo = estado["huella"] is not None and hmac.compare_digest(
+            estado["huella"], huella_password
+        )
 
-        # 1) Dato reciente y la contraseña coincide → respuesta inmediata
-        if mismo and u["data"] and ahora - u["actualizado"] < CACHE_SEG:
-            return resp(u, True)
+        # Dato reciente y la contraseña coincide -> respuesta inmediata
+        if mismo and estado["data"] and ahora - estado["actualizado"] < CACHE_SEG:
+            log.info("Consulta %s: caché", enmascarar(num))  # (respuesta desde caché)
+            return resp(estado, True)
 
         try:
             data = None
-            # 2) Token vigente → consulta directa
-            if mismo and u["token"] and u["exp"] > ahora + 60:
-                data = await consultar(num, u["token"])
+            # Token vigente -> consulta directa
+            if mismo and estado["token"] and estado["exp"] > ahora + 60:
+                data = await consultar(num, estado["token"])
 
-            # 3) Sin token, token vencido o contraseña distinta → login
+            # Sin token, token vencido o contraseña distinta -> login
             if data is None:
                 try:
                     token = await login(num, cred.password)
                 except LoginFallido:
-                    u["fallidos"][h] = ahora + BLOQUEO_SEG
+                    estado["fallidos"][huella_password] = ahora + BLOQUEO_SEG
                     raise
-                u.update(token=token, exp=jwt_exp(token), huella=h, data=None)
+                estado.update(
+                    token=token,
+                    exp=jwt_exp(token),
+                    huella=huella_password,
+                    data=None,
+                )
                 mismo = True
                 data = await consultar(num, token)
                 if data is None:
                     raise RuntimeError("Telcel rechazó el token recién obtenido")
 
-            u["data"] = parsear_home(data)
-            u["actualizado"] = int(time.time())
-            return resp(u, False)
+            estado["data"] = parsear_home(data)
+            estado["actualizado"] = int(time.time())
+            log.info("Consulta %s: Telcel OK", enmascarar(num))  # (consulta a Telcel)
+            return resp(estado, False)
 
-        except LoginFallido as e:
-            raise HTTPException(401, str(e))
-        except Exception as e:
+        except LoginFallido as error:
+            raise HTTPException(401, str(error)) from error
+        except Exception as error:
             log.error("Fallo para %s:\n%s", enmascarar(num), traceback.format_exc())
-            if mismo and u["data"]:
-                return resp(u, True, error=type(e).__name__)  # último dato bueno
-            raise HTTPException(502, "No se pudo consultar Telcel")
+            if mismo and estado["data"]:
+                return resp(
+                    estado, True, error=type(error).__name__
+                )  # último dato bueno
+            raise HTTPException(502, "No se pudo consultar Telcel") from error
 
 
 @app.get("/health")
 async def health():
+    """Devuelve el estado del servicio y la cantidad de usuarios activos."""
     return {"ok": True, "usuarios_activos": len(usuarios)}
