@@ -2,7 +2,7 @@
 
 // Configuración
 
-const URL = "https://tu-app.up.railway.app/saldo";
+const API_URL = "https://tu-app.up.railway.app/saldo";
 const KEY = "TU_API_KEY";
 
 // Qué mostrar (pon false lo que no quieras ver)
@@ -176,6 +176,21 @@ async function verificarNotificacion(res) {
   } else if (Keychain.contains(KC_NOTIF)) {
     Keychain.remove(KC_NOTIF);
   }
+}
+
+async function probarNotificacion(res) {
+  const d = res && res.data;
+  const p = d && d.paquetes && d.paquetes[0];
+  const n = new Notification();
+  n.title = "Prueba: Te quedan pocos datos";
+  n.body =
+    p && !p.ilimitado && p.porcentaje_disponible != null
+      ? `Queda ${Math.round(p.porcentaje_disponible)}% (${fmt(p.disponible_mb)}) de ${p.nombre || "tu paquete"}.`
+      : "Queda 10% de tu paquete.";
+  n.sound = "default";
+  n.openURL = URLScheme.forRunningScript();
+  n.setTriggerDate(new Date(Date.now() + 4000));
+  await n.schedule();
 }
 
 // Consulta
@@ -1033,6 +1048,7 @@ async function main() {
         "Vista previa: mediano",
         "Vista previa: grande",
         "Cambiar número/contraseña",
+        "Probar notificación (Aviso pocos datos)",
       ].forEach((x) => m.addAction(x));
       m.addDestructiveAction("Borrar mis datos de este iPhone");
       m.addCancelAction("Cancelar");
@@ -1040,13 +1056,18 @@ async function main() {
       const op = await m.present();
       if (op === -1) return;
       if (op === 5) {
+        await probarNotificacion(leerRespaldo());
+        await aviso("Notificación enviada", "Debería llegar en unos segundos.");
+        return;
+      }
+      if (op === 6) {
         borrarTodo();
         await aviso("Listo", "Se borraron tus datos de este iPhone.");
         return;
       }
       if (op === 4 && !(await pedirCredenciales())) return;
       forzar = op === 0 || op === 4;
-      familia = ["medium", "small", "medium", "large", "medium"][op];
+      familia = ["medium", "small", "medium", "large", "medium", "medium"][op];
     }
   }
 
